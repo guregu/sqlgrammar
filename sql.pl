@@ -1,34 +1,114 @@
-% :- module(sql, []).
+:- module(sql, [sqlc_crud//3, create_table//3, sql_table/3]).
 
-
-test :-
-	once(phrase(create_table("test", [
-		col("a", varchar(255), []),
-		col("foo", bigint, []),
-		col("bar", decimal, [null(true)]),
-		col("baz", decimal(10, 2), [])
-	], [
-		primary(["a", "foo"]),
-		unique(["baz"])
-	]), Cs)),
-	format("~n~s~n~n", [Cs]).
+sqlc_crud(Name, Cols, Keys) -->
+	{ gather_enums(Cols, Enums) },
+	create_types(Enums),
+	nl_maybe,
+	create_table(Name, Cols, Keys),
+	nl_maybe,
+	sqlc_select_one(Name, Keys),
+	nl_maybe,
+	sqlc_select_many(Name, Keys),
+	nl_maybe,
+	sqlc_insert_one(Name, Cols, Keys).
 
 %% create_table(+Name, +Cols, +Keys).
 create_table(Name, Cols, Keys) -->
 	{ sql_table(Cols, Keys, _TODO) },
 	"CREATE TABLE", ws,
 	table_name(Name), ws,
-	"(",
+	"(", nl_maybe,
 	maybe_ws,
 	create_table_cols(Cols),
 	create_table_keys(Cols, Keys),
 	maybe_ws,
-	")",
-	maybe_ws.
+	");",
+	maybe_ws,
+	"\n".
+
+sqlc_select_one(Name, Keys) -->
+	sqlc_magic("Get", Name, one),
+	"SELECT * FROM ",
+	table_name(Name), nl_maybe,
+	{ memberchk(primary(PK), Keys) },
+	where_eq(PK), ";\n".
+
+sqlc_select_many(Name, Keys) -->
+	sqlc_magic("List", Name, many),
+	"SELECT * FROM ",
+	table_name(Name), nl_maybe,
+	{ memberchk(primary(PK), Keys) },
+	order_by(PK), ";\n".
+
+sqlc_insert_one(Name, Cols, _Keys) -->
+	sqlc_magic("Create", Name, one),
+	"INSERT INTO ",
+	table_name(Name), ws_maybe,
+	"(", nl_maybe,
+	comma_list(column_with_placeholder_comment(Cols), Cols),
+	")", ws_maybe, "VALUES", ws_maybe, "(", "\n\t",
+	placeholders(Cols),
+	nl_maybe,
+	")", nl_maybe,
+	"RETURNING *;\n".
+
+sqlc_magic(Prefix, ModelName, Nature) -->
+	"-- name: ",
+	seq_not(' ', Prefix),
+	title_case(ModelName),
+	plural_suffix(ModelName, Nature),
+	" ",
+	sqlc_nature(Nature),
+	nl_maybe.
+
+sqlc_nature(one) --> ":one".
+sqlc_nature(many) --> ":many".
+sqlc_nature(exec) --> ":exec".
+
+order_by(Key) -->
+	"ORDER BY ",
+	comma_list(column_name, Key).
+
+where_eq([]) --> [].
+where_eq([K|Ks]) -->
+	where_eq_([K|Ks], 1).
+where_eq_([], _) --> [].
+where_eq_([K|Ks], 1) -->
+	"WHERE", ws, column_name(K), ws_maybe, "=", ws_maybe, placeholder(1),
+	where_eq_(Ks, 2).
+where_eq_([K|Ks], N) -->
+	{ N > 1 },
+	" AND", ws, column_name(K), ws_maybe, "=", ws_maybe, placeholder(N),
+	{ succ(N, N2) },
+	where_eq_(Ks, N2).
 
 table_name(Name) --> quoted_string(Name).
 
-column_name(Name) --> quoted_string(Name).
+% column_name(col(Name, _, _)) --> quoted_string(Name).
+column_name(Name) --> { Name \= col(_, _, _) }, quoted_string(Name).
+
+column_with_placeholder_comment(Cols, Col) -->
+	{ Col = col(Name, _, _) },
+	( "\t" | [] ),
+	column_name(Name),
+	" -- ",
+	{ nth1(N, Cols, Col) },
+	placeholder(N),
+	nl_maybe.
+
+create_types([N-Vs|Cs]) -->
+	create_type(N, Vs),
+	create_types(Cs).
+create_types([]) --> [].
+
+create_type(Name, enum(Vs)) -->
+	"CREATE TYPE ",
+	quoted_string(Name),
+	" AS ENUM",
+	"(",
+	comma_list(string_literal, Vs),
+	");",
+	nl_maybe.
 
 create_table_cols(Cols) -->
 	maybe_ws,
@@ -36,9 +116,14 @@ create_table_cols(Cols) -->
 	maybe_ws.
 
 create_table_col(col(Name, Type, Attrs)) -->
+	("\t" | []),
 	column_name(Name), ws,
-	column_type(Type), 
-	column_attrs(Attrs).
+	(  { Type = enum(_) }
+	-> column_name(Name)
+	;  column_type(Type)
+	), 
+	column_attrs(Attrs),
+	"\n".
 
 create_table_keys(_Cols, []) --> [].
 create_table_keys(_Cols, [K|Ks]) -->
@@ -51,10 +136,12 @@ create_table_key(primary(Cols)) --> create_table_key_("PRIMARY KEY", Cols).
 create_table_key(unique(Cols)) --> create_table_key_("UNIQUE", Cols).
 
 create_table_key_(Kind, Cols) -->
+	("\t" | []),
 	seq_not('(', Kind), ws,
 	"(", maybe_ws,
 	key_columns(Cols),
-	")", maybe_ws.
+	")", maybe_ws,
+	"\n".
 
 column_type(char(N)) --> column_type_("CHAR", N).
 column_type(char) --> "CHAR".
@@ -84,6 +171,38 @@ column_type(bigint) --> "BIGINT".
 column_type(date) --> "DATE".
 column_type(time) --> "TIME".
 column_type(timestamp) --> "TIMESTAMP".
+% Postgres
+column_type(serial) --> "SERIAL".
+column_type(bigserial) --> "BIGSERIAL".
+column_type(smallserial) --> "SMALLSERIAL".
+column_type(boolean) --> "BOOLEAN".
+column_type(json) --> "JSON".
+column_type(xml) --> "XML".
+column_type(enum(Values)) --> "ENUM(", comma_list(string_literal, Values), ")".
+column_type(interval) --> "INTERVAL".
+column_type(array(T)) --> column_type(T), "[]".
+column_type(array(T, N)) --> column_type(T), "[", number(N), "]".
+column_type(uuid) --> "UUID".
+column_type(bytea) --> "BYTEA".
+column_type(bit(N)) --> column_type_("BIT", N).
+column_type(bit) --> "BIT".
+column_type(varbit(N)) --> column_type_("VARBIT", N).
+column_type(varbit) --> "VARBIT".
+column_type(money) --> "MONEY".
+column_type(timestamp_with_timezone) --> "TIMESTAMP", ws, "WITH", ws, "TIME", ws, "ZONE".
+column_type(time_with_timezone) --> "TIME", ws, "WITH", ws, "TIME", ws, "ZONE".
+column_type(inet) --> "INET".
+column_type(cidr) --> "CIDR".
+column_type(macaddr) --> "MACADDR".
+column_type(point) --> "POINT".
+column_type(line) --> "LINE".
+column_type(lseg) --> "LSEG".
+column_type(box) --> "BOX".
+column_type(path) --> "PATH".
+column_type(polygon) --> "POLYGON".
+column_type(circle) --> "CIRCLE".
+column_type(oid) --> "OID".
+column_type(literal(Cs)) --> seq_not(' ', Cs).
 
 column_type_(Type, N) -->
 	seq_not('(', Type),
@@ -112,11 +231,6 @@ column_attrs([A|As]) -->
 	ws,
 	column_attr(A),
 	column_attrs(As).
-% column_attrs_([]) --> [].
-% column_attrs_([A|As]) -->
-% 	ws,
-% 	column_attr(A),
-% 	column_attrs_(As).
 
 column_attr(null(false)) --> "NOT NULL".
 column_attr(null(true)) --> "NULL".
@@ -130,6 +244,24 @@ quoted_string(Name) -->
 	"\"",
 	seq_not('"', Name),
 	"\"".
+
+string_literal(Cs) -->
+	"'",
+	seq_not('\'', Cs),
+	"'".
+
+placeholders([]) --> [].
+placeholders([_|Xs]) -->
+	placeholder(1),
+	placeholders(Xs, 2).
+placeholders([], _) --> [].
+placeholders([_|Rest], N0) -->
+	",", ws_maybe,
+	placeholder(N0),
+	{ succ(N0, N) },
+	placeholders(Rest, N).
+
+placeholder(N) --> "$", number(N).
 
 number(N) -->
 	{ number_chars(N, Cs) },
@@ -146,6 +278,17 @@ comma_list_(Nonterminal, [X|Xs]) -->
 	call(Nonterminal, X),
 	comma_list_(Nonterminal, Xs).
 
+% TODO: double check
+title_case([C0|Cs]) --> { atom_upper(C0, C) }, [C], title_case_(Cs).
+title_case_(['_', C0|Cs]) --> { atom_upper(C0, C) }, [C], title_case_(Cs).
+title_case_([C|Cs]) --> { dif(C, '_') }, [C], title_case_(Cs).
+title_case_([]) --> [].
+
+plural_suffix(_, many) --> "s".
+plural_suffix(_, Nature) --> { dif(Nature, many) }, [].
+
+plural(Cs) --> seq(Cs), "s".
+
 seq_not(_, []) --> [].
 seq_not(X, [C|Cs]) -->
 	[C],
@@ -154,6 +297,7 @@ seq_not(X, [C|Cs]) -->
 
 ws --> " ".
 nl --> "\n" | ws.
+nl_maybe --> "\n" | [].
 ws_maybe --> ws | [].
 maybe_ws --> [] | ws.
 
@@ -234,8 +378,47 @@ type(bigint).
 type(date).
 type(time).
 type(timestamp).
+% PostgreSQL specific types
+type(serial).
+type(bigserial).
+type(smallserial).
+type(boolean).
+type(json).
+type(enum(Values)) :-
+	Values = [_|_],
+	maplist(string, Values).
+type(interval).
+type(array(T)) :- type(T).
+type(array(T, N)) :- type(T), integer(N), N > 0.
+type(uuid).
+type(bytea).
+type(bit).
+type(bit(N)) :- integer(N).
+type(varbit(N)) :- integer(N).
+type(varbit).
+type(money).
+type(timestamp_with_timezone).
+type(time_with_timezone).
+type(inet).
+type(cidr).
+type(macaddr).
+type(point).
+type(line).
+type(lseg).
+type(box).
+type(path).
+type(polygon).
+type(circle).
+type(oid).
+type(xml).
 
 attr(null(true)).
 attr(null(false)).
 attr(unique).
 %attr(autoincrement).
+
+gather_enums(Cols, Enums) :-
+	setof(Name-enum(Vs), member(col(Name, enum(Vs), _), Cols), Enums).
+gather_enums(Cols, []) :-
+	\+ member(col(_, enum(_), _), Cols).
+
